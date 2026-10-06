@@ -1,0 +1,343 @@
+import json
+import re
+import shutil
+import wave
+from datetime import datetime
+from pathlib import Path
+
+DATA_DIR = Path("data")
+
+# Meeting ids are system-generated as {YYYYMMDD}-{HHMMSS}-{slug}; anything else
+# (notably ".", "..", "/") must never reach the filesystem layer.
+_VALID_ID = re.compile(r"^\d{8}-\d{6}-[\w一-龥-]+$")
+
+
+def is_valid_meeting_id(meeting_id: str) -> bool:
+    return bool(_VALID_ID.match(meeting_id or ""))
+
+
+def set_data_dir(path: str) -> Path:
+    global DATA_DIR
+    DATA_DIR = Path(path).expanduser().resolve()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_DIR
+
+
+def get_data_dir() -> Path:
+    return DATA_DIR
+
+
+
+def _slugify(title: str) -> str:
+    s = re.sub(r"[^\w一-龥\-]", "-", title.strip())
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s[:40] or "untitled"
+
+
+def _write_meta(mdir: Path, meta: dict) -> None:
+    """Atomic write (tmp + rename) so a crash mid-write can't leave a
+    half-written meta.json that would break the whole meeting list."""
+    tmp = mdir / "meta.json.tmp"
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(mdir / "meta.json")
+
+
+def _read_meta(mdir: Path) -> dict | None:
+    f = mdir / "meta.json"
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _read_json(p: Path):
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _read_text(p: Path):
+    if not p.exists():
+        return None
+    return p.read_text(encoding="utf-8")
+
+
+def create_meeting(title: str, audio_path: str, ext: str) -> str:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    meeting_id = f"{ts}-{_slugify(title)}"
+    mdir = DATA_DIR / meeting_id
+    mdir.mkdir(parents=True, exist_ok=True)
+    dst = mdir / f"audio.{ext}"
+    shutil.copyfile(audio_path, dst)
+    meta = {
+        "id": meeting_id,
+        "title": title,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "audio_file": f"audio.{ext}",
+        "audio_wav": None,
+        "duration_ms": 0,
+        "status": "pending",
+        "spk_count": 0,
+        "error": None,
+        "polish_warning": None,
+        "tags": [],
+        "source": "upload",
+    }
+    _write_meta(mdir, meta)
+    return meeting_id
+
+
+def create_live_meeting(title: str) -> str:
+    """Create a meeting with no input audio for live streaming."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    meeting_id = f"{ts}-{_slugify(title)}"
+    mdir = DATA_DIR / meeting_id
+    mdir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "id": meeting_id,
+        "title": title,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "audio_file": None,
+        "audio_wav": None,
+        "duration_ms": 0,
+        "status": "live_recording",
+        "spk_count": 0,
+        "error": None,
+        "polish_warning": None,
+        "tags": [],
+        "source": "live",
+    }
+    _write_meta(mdir, meta)
+    return meeting_id
+
+
+def save_live_audio(meeting_id: str, pcm: bytes, sample_rate: int = 16000) -> str:
+    """Write PCM int16 mono to a wav file directly (no shutil.copy to avoid 9p/drvfs EPERM)."""
+    mdir = DATA_DIR / meeting_id
+    fname = "audio_live.wav"
+    path = mdir / fname
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return fname
+
+
+def list_meetings() -> list[dict]:
+    if not DATA_DIR.exists():
+        return []
+    items = []
+    for d in DATA_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        meta = _read_meta(d)
+        if meta:
+            items.append(meta)
+    items.sort(key=lambda m: m["created_at"], reverse=True)
+    return items
+
+
+def get_meeting(meeting_id: str) -> dict | None:
+    if not is_valid_meeting_id(meeting_id):
+        return None
+    mdir = DATA_DIR / meeting_id
+    meta = _read_meta(mdir)
+    if not meta:
+        return None
+    return {
+        "meta": meta,
+        "raw": _read_json(mdir / "raw.json"),
+        "processed": _read_text(mdir / "processed.md"),
+        "summary": _read_text(mdir / "summary.md"),
+        "summary_json": _read_json(mdir / "summary.json"),
+    }
+
+
+def save_raw(meeting_id: str, raw: dict) -> None:
+    (DATA_DIR / meeting_id / "raw.json").write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def save_processed(meeting_id: str, md: str) -> None:
+    (DATA_DIR / meeting_id / "processed.md").write_text(md, encoding="utf-8")
+
+
+def save_summary(meeting_id: str, md: str) -> None:
+    (DATA_DIR / meeting_id / "summary.md").write_text(md, encoding="utf-8")
+
+
+def save_summary_json(meeting_id: str, data) -> None:
+    f = DATA_DIR / meeting_id / "summary.json"
+    if data is None:
+        if f.exists():
+            f.unlink()
+        return
+    f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# --- v0.7 个人笔记层（3.2）: notes.json，独立于纪要本体，重新整理不覆盖 ---
+
+def load_notes(meeting_id: str) -> list:
+    if not is_valid_meeting_id(meeting_id):
+        return []
+    data = _read_json(DATA_DIR / meeting_id / "notes.json")
+    return data if isinstance(data, list) else []
+
+
+def save_notes(meeting_id: str, notes: list) -> None:
+    mdir = DATA_DIR / meeting_id
+    # 与 meta.json 同款原子写：崩溃在半路也不会留下损坏的 notes.json
+    tmp = mdir / "notes.json.tmp"
+    tmp.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(mdir / "notes.json")
+
+
+# --- v0.7 议题时间轴（3.3）: topics.json，{"segments": [...], "manual": bool} ---
+
+def load_topics(meeting_id: str) -> dict | None:
+    if not is_valid_meeting_id(meeting_id):
+        return None
+    data = _read_json(DATA_DIR / meeting_id / "topics.json")
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+        return None
+    return data
+
+
+def save_topics(meeting_id: str, data: dict) -> None:
+    mdir = DATA_DIR / meeting_id
+    tmp = mdir / "topics.json.tmp"
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(mdir / "topics.json")
+
+
+def append_log_line(meeting_id: str, entry: dict) -> None:
+    f = DATA_DIR / meeting_id / "log.jsonl"
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_log_lines(meeting_id: str) -> list:
+    f = DATA_DIR / meeting_id / "log.jsonl"
+    if not f.exists():
+        return []
+    out = []
+    for line in f.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def load_templates() -> list:
+    return _read_json(DATA_DIR / "templates.json") or []
+
+
+def save_templates(templates: list) -> None:
+    (DATA_DIR / "templates.json").write_text(
+        json.dumps(templates, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def update_meta(meeting_id: str, **fields) -> None:
+    mdir = DATA_DIR / meeting_id
+    meta = _read_meta(mdir)
+    if meta is None:
+        return
+    meta.update(fields)
+    _write_meta(mdir, meta)
+
+
+def delete_meeting(meeting_id: str) -> None:
+    if not is_valid_meeting_id(meeting_id):
+        return
+    mdir = DATA_DIR / meeting_id
+    if mdir.exists():
+        shutil.rmtree(mdir)
+
+
+def trash_dir() -> Path:
+    return DATA_DIR / "回收站"
+
+
+# Trashed entries are meeting dirs, optionally suffixed ".N" on name collision.
+_VALID_TRASH_NAME = re.compile(r"^\d{8}-\d{6}-[\w一-龥-]+(\.\d+)?$")
+
+
+def list_trash() -> list[dict]:
+    td = trash_dir()
+    if not td.exists():
+        return []
+    items = []
+    for d in td.iterdir():
+        if not d.is_dir() or not _VALID_TRASH_NAME.match(d.name):
+            continue
+        meta = _read_meta(d) or {}
+        items.append({
+            "name": d.name,
+            "id": meta.get("id", d.name),
+            "title": meta.get("title", d.name),
+            "created_at": meta.get("created_at", ""),
+            "status": meta.get("status", ""),
+        })
+    items.sort(key=lambda m: m["created_at"], reverse=True)
+    return items
+
+
+def restore_from_trash(name: str) -> bool:
+    """Move a trashed meeting back to the data dir.
+
+    Collision-suffixed trash names ("<id>.1") restore to the original meeting
+    id; returns False if the trash entry is missing or the id is taken.
+    """
+    if not _VALID_TRASH_NAME.match(name or ""):
+        return False
+    src = trash_dir() / name
+    base = re.sub(r"\.\d+$", "", name)  # meeting ids never contain dots
+    dst = DATA_DIR / base
+    if not src.is_dir() or dst.exists():
+        return False
+    src.rename(dst)  # same filesystem: atomic, 9p-safe
+    return True
+
+
+def delete_from_trash(name: str) -> bool:
+    if not _VALID_TRASH_NAME.match(name or ""):
+        return False
+    target = trash_dir() / name
+    if not target.is_dir():
+        return False
+    shutil.rmtree(target)
+    return True
+
+
+def move_to_trash(meeting_id: str) -> Path | None:
+    if not is_valid_meeting_id(meeting_id):
+        return None
+    mdir = DATA_DIR / meeting_id
+    if not mdir.exists():
+        return None
+    td = trash_dir()
+    td.mkdir(parents=True, exist_ok=True)
+    target = td / meeting_id
+    i = 1
+    while target.exists():
+        target = td / f"{meeting_id}.{i}"
+        i += 1
+    # rename within DATA_DIR (same filesystem): atomic, no copymode, 9p-safe
+    mdir.rename(target)
+    return target
+
+
+def meeting_dir(meeting_id: str) -> Path:
+    return DATA_DIR / meeting_id

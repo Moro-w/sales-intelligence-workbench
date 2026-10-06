@@ -1,0 +1,505 @@
+import asyncio
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+
+from app import storage, tasks
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    tasks._tasks.clear()
+    tasks._asr_lock = asyncio.Lock()
+    tasks._CONVERT_SEM = asyncio.Semaphore(3)
+    yield
+    tasks._tasks.clear()
+
+
+def test_estimate_total_seconds():
+    # B10: RTF is device-dependent (cuda 0.025 / mps 0.25 / cpu 4.7), no longer
+    # hard-coded 0.25. The estimate must track _asr_rtf() on whichever device
+    # the test machine is.
+    rtf = tasks._asr_rtf()
+    assert tasks.estimate_total_seconds(60 * 60 * 1000) == 60 * 60 * rtf
+
+
+def test_asr_rtf_in_valid_range():
+    rtf = tasks._asr_rtf()
+    assert rtf in (0.025, 0.25, 4.7)
+
+
+def test_get_progress_unknown():
+    assert tasks.get_progress("nope") is None
+
+
+def test_register_task():
+    state = tasks.register_task("mid-1")
+    assert state["meeting_id"] == "mid-1"
+    assert state["status"] == "pending"
+    assert state["progress"] == 0
+    assert tasks.get_progress(state["task_id"]) is not None
+
+
+def test_latest_task_id_returns_newest():
+    t1 = tasks.register_task("mid-x")
+    t2 = tasks.register_task("mid-x")
+    assert tasks.latest_task_id("mid-x") == t2["task_id"]
+    assert tasks.latest_task_id("mid-x") != t1["task_id"]
+    assert tasks.latest_task_id("no-such") is None
+
+
+def test_advance_progress_caps_at_stage_end():
+    state = tasks.register_task("mid-2")
+    tasks.update(state["task_id"], status="asr_running", progress=10,
+                 step="ASR", started_at=0, estimated_total_s=100)
+    tasks.advance_asr_progress(state["task_id"], elapsed_s=10)
+    p = tasks.get_progress(state["task_id"])["progress"]
+    assert 5 <= p < 55
+
+
+@pytest.fixture
+def data_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path / "data")
+    storage.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return storage.DATA_DIR
+
+
+def _make_meeting(data_dir):
+    src = data_dir.parent / "a.wav"
+    src.write_bytes(b"x")
+    return storage.create_meeting("t", str(src), "wav")
+
+
+def test_append_log_persists_to_disk(data_dir):
+    mid = _make_meeting(data_dir)
+    tasks.append_log(mid, "info", "hello")
+    assert any(l["msg"] == "hello" for l in storage.read_log_lines(mid))
+
+
+def test_append_log_reaches_all_tasks_of_meeting(data_dir):
+    mid = _make_meeting(data_dir)
+    t1 = tasks.register_task(mid)
+    t2 = tasks.register_task(mid)
+    tasks.append_log(mid, "info", "hi")
+    assert any(l["msg"] == "hi" for l in tasks._tasks[t1["task_id"]]["logs"])
+    assert any(l["msg"] == "hi" for l in tasks._tasks[t2["task_id"]]["logs"])
+
+
+def test_get_logs_prefers_latest_task(data_dir):
+    mid = _make_meeting(data_dir)
+    old = tasks.register_task(mid)
+    tasks.update(old["task_id"], status="error", error="boom")
+    tasks.register_task(mid)
+    new_id = tasks.latest_task_id(mid)
+    tasks.update(new_id, status="asr_running", progress=30)
+    out = tasks.get_logs(mid)
+    assert out["status"] == "asr_running"
+
+
+def test_run_pipeline_updates_the_given_task(data_dir, monkeypatch):
+    """After resume/retry a meeting has several tasks; run_pipeline must update
+    the task the caller registered (the one the frontend polls), not the
+    oldest stale one."""
+    mid = _make_meeting(data_dir)
+    old = tasks.register_task(mid)
+    tasks.update(old["task_id"], status="error", error="stale")
+    new = tasks.register_task(mid)
+    monkeypatch.setattr(tasks, "_convert_audio", mock.AsyncMock())
+    monkeypatch.setattr(tasks, "_run_asr", mock.AsyncMock())
+    asyncio.run(tasks.run_pipeline(mid, cfg=None, task_id=new["task_id"]))
+    assert tasks.get_progress(new["task_id"])["status"] == "asr_done"
+    assert tasks.get_progress(old["task_id"])["status"] == "error"
+
+
+def test_run_pipeline_falls_back_to_latest_task(data_dir, monkeypatch):
+    mid = _make_meeting(data_dir)
+    old = tasks.register_task(mid)
+    tasks.update(old["task_id"], status="error", error="stale")
+    new = tasks.register_task(mid)
+    monkeypatch.setattr(tasks, "_convert_audio", mock.AsyncMock())
+    monkeypatch.setattr(tasks, "_run_asr", mock.AsyncMock())
+    asyncio.run(tasks.run_pipeline(mid, cfg=None))
+    assert tasks.get_progress(new["task_id"])["status"] == "asr_done"
+    assert tasks.get_progress(old["task_id"])["status"] == "error"
+
+
+def test_pipeline_does_not_serialize_convert_with_asr(data_dir, monkeypatch):
+    """P1: _asr_lock is scoped to ASR only. Meeting B's convert must run while
+    meeting A's ASR still holds the lock (no whole-pipeline serialization)."""
+    # distinct titles → distinct meeting ids (same-second + same slug would collide)
+    src = data_dir.parent / "a.wav"; src.write_bytes(b"x")
+    mid_a = storage.create_meeting("alpha", str(src), "wav")
+    mid_b = storage.create_meeting("beta", str(src), "wav")
+    assert mid_a != mid_b
+    tasks._asr_lock = asyncio.Lock()
+    log = []
+    asr_holding = asyncio.Event()
+
+    async def convert(task_id, meeting_id, cfg):
+        if meeting_id == mid_b:
+            log.append(("convert_b_while_asr_held", asr_holding.is_set()))
+
+    async def asr(task_id, meeting_id, cfg):
+        async with tasks._asr_lock:
+            asr_holding.set()
+            await asyncio.sleep(0.05)
+            asr_holding.clear()
+
+    monkeypatch.setattr(tasks, "_convert_audio", convert)
+    monkeypatch.setattr(tasks, "_run_asr", asr)
+
+    async def go():
+        a = asyncio.create_task(tasks.run_pipeline(mid_a, cfg=None))
+        await asyncio.sleep(0.02)  # let A reach & acquire the ASR lock
+        b = asyncio.create_task(tasks.run_pipeline(mid_b, cfg=None))
+        await asyncio.gather(a, b)
+
+    asyncio.run(go())
+    assert ("convert_b_while_asr_held", True) in log  # B's convert overlapped A's ASR
+    assert storage.get_meeting(mid_a)["meta"]["status"] == "asr_done"
+    assert storage.get_meeting(mid_b)["meta"]["status"] == "asr_done"
+
+
+def test_retry_llm_runs_concurrently_without_asr_lock(data_dir, monkeypatch):
+    """P1: retry_llm (polish+summarize) takes no lock — two meetings can polish
+    at once (LLM is external, no model contention)."""
+    src = data_dir.parent / "a.wav"; src.write_bytes(b"x")
+    mid_a = storage.create_meeting("alpha", str(src), "wav")
+    mid_b = storage.create_meeting("beta", str(src), "wav")
+    assert mid_a != mid_b
+    holding = asyncio.Event()
+    overlapped = {"value": False}
+
+    async def polish(task_id, meeting_id, cfg):
+        if meeting_id == mid_a:
+            holding.set()
+            await asyncio.sleep(0.05)
+            holding.clear()
+        else:
+            overlapped["value"] = holding.is_set()
+
+    monkeypatch.setattr(tasks, "_run_polish", polish)
+    monkeypatch.setattr(tasks, "_run_summarize", mock.AsyncMock())
+
+    async def go():
+        a = asyncio.create_task(tasks.retry_llm(mid_a, cfg=None))
+        await asyncio.sleep(0.02)
+        b = asyncio.create_task(tasks.retry_llm(mid_b, cfg=None))
+        await asyncio.gather(a, b)
+
+    asyncio.run(go())
+    # retry_llm must NOT serialize, so B's polish overlaps A's
+    assert overlapped["value"] is True
+
+
+def test_get_logs_reads_disk_when_not_in_memory(data_dir):
+    mid = _make_meeting(data_dir)
+    tasks.append_log(mid, "info", "cached")
+    tasks._tasks.clear()  # simulate process restart
+    out = tasks.get_logs(mid)
+    assert out["logs"] and out["logs"][0]["msg"] == "cached"
+
+
+def test_record_timing_and_summary(data_dir):
+    mid = _make_meeting(data_dir)
+    tasks._record_timing(mid, "convert", 3.1)
+    tasks._record_timing(mid, "asr", 12.3)
+    tasks._log_stage_summary(mid, "识别阶段完成", ("convert", "转换"), ("asr", "识别"))
+    meta = storage.get_meeting(mid)["meta"]
+    assert meta["timings"]["asr"] == 12.3
+    assert "识别阶段完成" in storage.read_log_lines(mid)[-1]["msg"]
+
+
+def test_run_polish_sets_and_clears_polish_warning(data_dir, monkeypatch):
+    """on_quality 报"假整理"时 meta.polish_warning 必须落盘（前端横幅的数据源），
+    重新整理见效后要清掉，否则旧告警会一直挂着。"""
+    mid = _make_meeting(data_dir)
+    storage.save_raw(mid, {"text": "x", "sentences": [{"text": "hi", "start": 0, "end": 1, "spk": 0}], "spk_count": 1})
+    tid = tasks.register_task(mid)["task_id"]
+    cfg = mock.Mock()
+
+    def fake_polish(sentences, _cfg, on_log=None, on_progress=None,
+                    meeting_context="", template_hint="", on_quality=None, _info=None):
+        if on_quality:
+            on_quality(fake_polish.info)
+        return "## 说话人 0\nhi"
+
+    fake_polish.info = {"flagged": 1, "total": 1, "similarity": 1.0}
+    monkeypatch.setattr(tasks.llm, "polish", fake_polish)
+    asyncio.run(tasks._run_polish(tid, mid, cfg))
+    assert storage.get_meeting(mid)["meta"]["polish_warning"]
+
+    # 用户点过 × 关闭横幅后，重新整理又触发告警：新告警必须重新弹出
+    storage.update_meta(mid, polish_warning_dismissed=True)
+    asyncio.run(tasks._run_polish(tid, mid, cfg))
+    meta = storage.get_meeting(mid)["meta"]
+    assert meta["polish_warning"]
+    assert meta["polish_warning_dismissed"] is False
+
+    fake_polish.info = {"flagged": 0, "total": 1, "similarity": 0.0}
+    asyncio.run(tasks._run_polish(tid, mid, cfg))
+    assert storage.get_meeting(mid)["meta"]["polish_warning"] is None
+
+
+# --- B8: _tasks bounded growth ----------------------------------------------
+def test_prune_tasks_evicts_oldest_terminal_first(monkeypatch):
+    monkeypatch.setattr(tasks, "_MAX_TASKS", 5)
+    tasks._tasks.clear()
+    ids = []
+    for _ in range(5):
+        st = tasks.register_task("m")
+        ids.append(st["task_id"])
+        tasks.update(st["task_id"], status="done")  # all terminal
+    # 6th registration exceeds the cap → oldest terminal task evicted
+    kept = tasks.register_task("m")
+    assert len(tasks._tasks) <= 5
+    assert ids[0] not in tasks._tasks  # oldest terminal evicted
+    assert ids[-1] in tasks._tasks     # newer terminal still around
+    assert kept["task_id"] in tasks._tasks
+
+
+def test_prune_tasks_never_evicts_busy(monkeypatch):
+    monkeypatch.setattr(tasks, "_MAX_TASKS", 3)
+    tasks._tasks.clear()
+    busy_ids = []
+    for _ in range(3):
+        st = tasks.register_task("m")
+        busy_ids.append(st["task_id"])
+        tasks.update(st["task_id"], status="asr_running")  # busy, must survive
+    # one more → cap exceeded but all are busy; we keep latest, drop oldest busy
+    tasks.register_task("m")
+    assert len(tasks._tasks) <= 3
+    # the two most recently registered must still be present
+    assert busy_ids[-1] in tasks._tasks
+
+
+# --- B12: finalize_live fallback keeps spk_count=0 ----------------------
+def test_finalize_live_except_sets_spk_zero(data_dir, monkeypatch):
+    mid = _make_meeting(data_dir)
+
+    def boom(*a, **k):
+        raise RuntimeError("offline asr failed")
+
+    monkeypatch.setattr(tasks.asr, "transcribe", boom)
+    pcm = b"\x00\x00" * 16000  # 1 second of silence
+    result = {"sentences": [{"text": "a", "start": 0, "end": 1000, "spk": 0}]}
+    asyncio.run(tasks.finalize_live(mid, result, pcm, 16000, cfg=None))
+    raw = storage.get_meeting(mid)["raw"]
+    # B12: streaming sentences all have spk=0 → set() would wrongly give 1; expect 0.
+    assert raw["spk_count"] == 0
+    assert storage.get_meeting(mid)["meta"]["status"] == "asr_done"
+
+
+# --- v0.7.1: finalize persists the fallback synchronously, refines in background ---
+
+def _live_meeting(data_dir):
+    return storage.create_live_meeting("live-test")
+
+
+def test_finalize_live_persists_fallback_before_refinement(data_dir, monkeypatch):
+    """会议一结束就该看到流式稿和落定状态，而不是等离线二次识别跑完。"""
+    mid = _live_meeting(data_dir)
+    started = []
+
+    async def spy_refine(*a, **k):
+        started.append(True)
+        return None
+
+    monkeypatch.setattr(tasks, "_refine_live", spy_refine)
+    pcm = b"\x00\x00" * 32000  # 2s
+    result = {"sentences": [{"text": "你好", "start": 0, "end": 1000, "spk": 0}]}
+    asyncio.run(tasks.finalize_live(mid, result, pcm, 16000, cfg=None))
+    meta = storage.get_meeting(mid)["meta"]
+    raw = storage.get_meeting(mid)["raw"]
+    assert meta["status"] == "asr_done"
+    assert meta["audio_file"] == "audio_live.wav"
+    assert meta["duration_ms"] == 2000
+    assert meta["live_refined"] is False
+    assert raw["spk_count"] == 0
+    assert raw["sentences"][0]["text"] == "你好"
+    # refinement was queued, not awaited
+    assert started == [True]
+
+
+def test_refine_live_upgrades_raw(data_dir, monkeypatch):
+    mid = _live_meeting(data_dir)
+    storage.save_live_audio(mid, b"\x00\x00" * 16000, 16000)
+    storage.update_meta(mid, status="asr_done", audio_file="audio_live.wav",
+                        audio_wav="audio_live.wav", live_refined=False)
+
+    def fake_transcribe(wav_path, cfg, on_log=None):
+        return {"text": " refined", "sentences": [
+            {"text": "refined", "start": 0, "end": 900, "spk": 2}], "spk_count": 3}
+
+    monkeypatch.setattr(tasks.asr, "transcribe", fake_transcribe)
+    asyncio.run(tasks._refine_live(mid, "audio_live.wav", 1000, cfg=SimpleNamespace(asr=None), task_id=None))
+    raw = storage.get_meeting(mid)["raw"]
+    meta = storage.get_meeting(mid)["meta"]
+    assert raw["sentences"][0]["text"] == "refined"
+    assert raw["spk_count"] == 3
+    assert meta["status"] == "asr_done"
+    assert meta["live_refined"] is True
+    assert meta["spk_count"] == 3
+    tid = tasks.latest_task_id(mid)
+    assert tasks.get_progress(tid)["status"] == "asr_done"
+
+
+def test_refine_live_failure_keeps_fallback(data_dir, monkeypatch):
+    mid = _live_meeting(data_dir)
+    storage.save_live_audio(mid, b"\x00\x00" * 16000, 16000)
+    fallback = {"text": "fallback", "sentences": [
+        {"text": "fallback", "start": 0, "end": 1000, "spk": 0}], "spk_count": 0}
+    storage.save_raw(mid, fallback)
+    storage.update_meta(mid, status="asr_done", audio_file="audio_live.wav",
+                        audio_wav="audio_live.wav", live_refined=False)
+
+    def boom(*a, **k):
+        raise RuntimeError("offline asr failed")
+
+    monkeypatch.setattr(tasks.asr, "transcribe", boom)
+    asyncio.run(tasks._refine_live(mid, "audio_live.wav", 1000, cfg=SimpleNamespace(asr=None), task_id=None))
+    raw = storage.get_meeting(mid)["raw"]
+    meta = storage.get_meeting(mid)["meta"]
+    assert raw == fallback  # untouched fallback stays on disk
+    assert meta["status"] == "asr_done"
+    assert meta["live_refined"] is False  # recoverable via resume
+
+
+def test_refine_live_timeout_keeps_fallback_and_clears_busy(data_dir, monkeypatch):
+    import time as _time
+    mid = _live_meeting(data_dir)
+    storage.save_live_audio(mid, b"\x00\x00" * 16000, 16000)
+    storage.update_meta(mid, status="asr_done", audio_file="audio_live.wav",
+                        audio_wav="audio_live.wav", live_refined=False)
+
+    def stuck(*a, **k):
+        _time.sleep(3)  # simulates a worker thread blocked in native code
+
+    cleared = []
+    monkeypatch.setattr(tasks.asr, "transcribe", stuck)
+    monkeypatch.setattr(tasks.asr, "clear_busy", lambda: cleared.append(True))
+    monkeypatch.setattr(tasks, "_REFINE_TIMEOUT_FLOOR", 0.05)
+    monkeypatch.setattr(tasks, "estimate_total_seconds", lambda ms: 0.0)
+    asyncio.run(tasks._refine_live(mid, "audio_live.wav", 1000, cfg=SimpleNamespace(asr=None), task_id=None))
+    meta = storage.get_meeting(mid)["meta"]
+    assert meta["status"] == "asr_done"
+    assert meta["live_refined"] is False
+    assert cleared == [True]
+    tid = tasks.latest_task_id(mid)
+    assert tasks.get_progress(tid)["status"] == "error"
+
+
+def test_recover_live_sets_live_refined(data_dir, monkeypatch):
+    """recover_live 包装 run_pipeline：成功后必须落 live_refined=True，
+    否则整点 cron 会反复把同一会议重新排队。"""
+    mid = _live_meeting(data_dir)
+    src = data_dir.parent / "a.wav"
+    src.write_bytes(b"x")
+    storage.update_meta(mid, audio_file="a.wav")
+
+    async def fake_convert(task_id, meeting_id, cfg):
+        pass
+
+    async def fake_asr(task_id, meeting_id, cfg):
+        storage.save_raw(meeting_id, {"text": "x", "sentences": [
+            {"text": "x", "start": 0, "end": 1000, "spk": 0}], "spk_count": 1})
+
+    monkeypatch.setattr(tasks, "_convert_audio", fake_convert)
+    monkeypatch.setattr(tasks, "_run_asr", fake_asr)
+    asyncio.run(tasks.recover_live(mid, cfg=None))
+    meta = storage.get_meeting(mid)["meta"]
+    assert meta["status"] == "asr_done"
+    assert meta["live_refined"] is True
+
+
+# --- v0.7 (3.3): retry_llm 的议题阶段 -----------------------------------------
+
+def _meeting_with_raw(data_dir, name="t"):
+    src = data_dir.parent / "a.wav"
+    src.write_bytes(b"x")
+    mid = storage.create_meeting(name, str(src), "wav")
+    storage.save_raw(mid, {"text": "x", "sentences": [
+        {"text": "hi", "start": 0, "end": 1000, "spk": 0}], "spk_count": 1})
+    return mid
+
+
+def test_retry_llm_runs_topics_after_summarize(data_dir, monkeypatch):
+    mid = _meeting_with_raw(data_dir, "alpha")
+    called = []
+
+    async def polish(task_id, meeting_id, cfg):
+        pass
+
+    async def summarize(task_id, meeting_id, cfg):
+        pass
+
+    async def topics(task_id, meeting_id, cfg):
+        called.append(meeting_id)
+
+    monkeypatch.setattr(tasks, "_run_polish", polish)
+    monkeypatch.setattr(tasks, "_run_summarize", summarize)
+    monkeypatch.setattr(tasks, "_run_topics", topics)
+    asyncio.run(tasks.retry_llm(mid, cfg=None))
+    assert called == [mid]
+    assert storage.get_meeting(mid)["meta"]["status"] == "done"
+
+
+def test_retry_llm_topics_failure_is_not_fatal(data_dir, monkeypatch):
+    mid = _meeting_with_raw(data_dir, "beta")
+
+    async def boom(task_id, meeting_id, cfg):
+        raise RuntimeError("segment failed")
+
+    monkeypatch.setattr(tasks, "_run_polish", mock.AsyncMock())
+    monkeypatch.setattr(tasks, "_run_summarize", mock.AsyncMock())
+    monkeypatch.setattr(tasks, "_run_topics", boom)
+    asyncio.run(tasks.retry_llm(mid, cfg=None))
+    # 议题失败只记 warn，会议仍到 done
+    assert storage.get_meeting(mid)["meta"]["status"] == "done"
+    assert any("议题" in l["msg"] for l in storage.read_log_lines(mid))
+
+
+def test_run_topics_skips_when_manual(data_dir, monkeypatch):
+    mid = _meeting_with_raw(data_dir)
+    storage.save_topics(mid, {"segments": [{"topic": "A", "start": 0, "end": 1, "phase": "讨论"}], "manual": True})
+    must_not_run = mock.Mock(side_effect=AssertionError("segment_topics must not be called"))
+    monkeypatch.setattr(tasks.llm, "segment_topics", must_not_run)
+    tid = tasks.register_task(mid)["task_id"]
+    asyncio.run(tasks._run_topics(tid, mid, cfg=None))
+    must_not_run.assert_not_called()
+    assert storage.get_meeting(mid)["meta"]["status"] != "llm_topics"
+
+
+def test_run_topics_saves_segments(data_dir, monkeypatch):
+    mid = _meeting_with_raw(data_dir)
+    monkeypatch.setattr(tasks.llm, "segment_topics",
+                        lambda s, cfg, on_log=None: [{"topic": "议题A", "start": 0, "end": 1, "phase": "讨论"}])
+    tid = tasks.register_task(mid)["task_id"]
+    asyncio.run(tasks._run_topics(tid, mid, cfg=mock.Mock()))
+    t = storage.load_topics(mid)
+    assert t["manual"] is False and t["segments"][0]["topic"] == "议题A"
+    assert storage.get_meeting(mid)["meta"]["status"] == "llm_topics"
+
+
+def test_generate_topics_restores_previous_status(data_dir, monkeypatch):
+    mid = _meeting_with_raw(data_dir)
+    storage.update_meta(mid, status="done")
+    monkeypatch.setattr(tasks, "_run_topics", mock.AsyncMock())
+    asyncio.run(tasks.generate_topics(mid, cfg=None))
+    # 单独生成不吞掉会议终态
+    assert storage.get_meeting(mid)["meta"]["status"] == "done"
+
+
+def test_generate_topics_failure_keeps_status(data_dir, monkeypatch):
+    mid = _meeting_with_raw(data_dir)
+    storage.update_meta(mid, status="done")
+
+    async def boom(task_id, meeting_id, cfg):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(tasks, "_run_topics", boom)
+    tid = tasks.register_task(mid)["task_id"]
+    asyncio.run(tasks.generate_topics(mid, cfg=None, task_id=tid))
+    assert storage.get_meeting(mid)["meta"]["status"] == "done"
+    assert tasks.get_progress(tid)["status"] == "error"

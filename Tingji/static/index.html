@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>听记 · 让录音变成文字</title>
+  <link rel="stylesheet" href="/static/style.css?v=17">
+</head>
+<body>
+  <header>
+    <h1><a href="/" class="brand">听记</a><span class="brand-sub">让录音变成可读的笔记</span></h1>
+    <div class="header-right">
+      <div id="access-info-slot" class="header-access hidden"></div>
+      <button id="settings-btn" class="header-btn">设置</button>
+    </div>
+  </header>
+  <main class="container">
+    <div id="onboard-bar" class="onboard-bar hidden"></div>
+
+    <div class="steps">
+      <div class="step">
+        <span class="num">I.</span>
+        <div class="step-title">上传录音</div>
+        <div class="step-desc">拖入或选择音频文件，给它一个会议标题</div>
+      </div>
+      <div class="step">
+        <span class="num">II.</span>
+        <div class="step-title">校对原文</div>
+        <div class="step-desc">识别完成后双击任意一句修改错字，可顺手加入热词</div>
+      </div>
+      <div class="step">
+        <span class="num">III.</span>
+        <div class="step-title">一键整理</div>
+        <div class="step-desc">点「开始整理」生成会议纪要、决议与待办</div>
+      </div>
+    </div>
+
+    <section class="source-pick">
+      <a class="source-tab active" href="/">
+        <span class="source-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </span>
+        上传录音转写
+      </a>
+      <a class="source-tab" href="/live">
+        <span class="source-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        </span>
+        实时记录
+        <span class="source-sub">会议中直播</span>
+      </a>
+    </section>
+
+    <section class="upload-card">
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="选择或拖入音频文件">
+        <svg class="upload-icon" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="3" width="6" height="11" rx="3"/>
+          <path d="M5 11a7 7 0 0 0 14 0"/>
+          <line x1="12" y1="18" x2="12" y2="21"/>
+          <line x1="8" y1="21" x2="16" y2="21"/>
+        </svg>
+        <p>拖拽音频文件到此处，或点击选择</p>
+        <p class="hint">支持一次选多个文件批量转录 · wav · mp3 · m4a · aac · flac · ogg · opus</p>
+        <input id="file-input" type="file" accept="audio/*,.m4a,.aac,.opus" multiple hidden>
+      </div>
+      <ul id="queue" class="queue-list hidden"></ul>
+      <div class="form-row">
+        <span id="upload-hint" class="hint">每个文件可在下方改名；多个文件会并行转录（识别按队列依次进行）。</span>
+        <button id="submit-btn" disabled>开始转录</button>
+      </div>
+      <div id="error" class="error hidden"></div>
+    </section>
+
+    <section class="upload-card">
+      <h2>历史会议 <button id="trash-btn" class="mini trash-btn" type="button">回收站</button></h2>
+      <div id="tag-filter" class="tag-filter hidden"></div>
+      <ul id="history" class="history-list"></ul>
+    </section>
+  </main>
+
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-card">
+      <h3>设置</h3>
+      <div class="settings-tabs">
+        <button class="stab active" data-stab="templates">总结模板</button>
+        <button class="stab" data-stab="hotwords">热词</button>
+        <button class="stab" data-stab="dir">数据目录</button>
+        <button class="stab" data-stab="llm">LLM 配置</button>
+        <button class="stab" data-stab="server">服务</button>
+      </div>
+
+      <div class="spanel active" data-spanel="dir">
+        <p class="hint">会议录音、识别结果、整理纪要都会保存在这里。可改成你自己的目录。</p>
+        <div class="dir-browser">
+          <div class="dir-current">当前: <code id="dir-current">-</code></div>
+          <ul id="dir-list" class="dir-list"></ul>
+          <p class="hint" id="dir-writable"></p>
+        </div>
+        <details class="manual-input">
+          <summary>手动输入路径（高级）</summary>
+          <input id="data-dir-input" type="text" placeholder="/path/to/data">
+          <button id="dir-goto" class="mini" type="button">跳转</button>
+        </details>
+        <div id="dir-result" class="settings-result"></div>
+        <div class="modal-actions">
+          <button id="dir-up-btn" class="mini" type="button">返回上级</button>
+          <button id="dir-migrate-btn" class="hidden">迁移旧数据</button>
+          <button id="dir-select-btn" class="primary" type="button">保存此目录</button>
+        </div>
+      </div>
+
+      <div class="spanel" data-spanel="llm">
+        <p class="hint">用于把口语化的原文整理成通顺的会议纪要。可填本地 Ollama 或在线 API。</p>
+        <div class="radio-row">
+          <label><input type="radio" name="llm-mode" value="ollama" checked> Ollama 本地</label>
+          <label><input type="radio" name="llm-mode" value="api"> 在线 API</label>
+        </div>
+        <div id="llm-ollama" class="llm-fields">
+          <label>服务地址 (base_url)<input id="ollama-url" type="text" value="http://localhost:11434/v1"></label>
+          <div class="model-row">
+            <label style="flex:1">模型 <select id="ollama-model"></select></label>
+            <button id="ollama-refresh" class="mini" type="button">刷新列表</button>
+          </div>
+          <label class="think-row"><input id="ollama-think" type="checkbox"> 开启思考模式（Qwen3 等思考型模型：整理更准但更慢，长会议耗时明显增加）</label>
+          <button id="ollama-test" class="mini" type="button">测试连接</button>
+        </div>
+        <div id="llm-api" class="llm-fields hidden">
+          <label>base_url<input id="api-url" type="text" placeholder="https://api.openai.com/v1"></label>
+          <label>model<input id="api-model" type="text" placeholder="gpt-4o-mini"></label>
+          <label>api_key<input id="api-key" type="password" placeholder="留空不改"></label>
+          <button id="api-test" class="mini" type="button">测试连接</button>
+        </div>
+        <div id="llm-result" class="settings-result"></div>
+        <div class="modal-actions"><button id="llm-save-btn" class="primary" type="button">保存</button></div>
+      </div>
+
+      <div class="spanel" data-spanel="hotwords">
+        <p class="hint">每行一个热词（短语效果最好：人名 / 地名 / 专业术语）。保存后下次识别自动加载，提升相关词的准确率。手动纠正句子时也可勾选「加入热词」。</p>
+        <textarea id="hotwords-text" rows="10" placeholder="例如：&#10;听记&#10;FunASR&#10;Paraformer"></textarea>
+        <div id="hotwords-result" class="settings-result"></div>
+        <div class="modal-actions"><button id="hotwords-save-btn" class="primary" type="button">保存热词</button></div>
+      </div>
+
+      <div class="spanel" data-spanel="templates">
+        <p class="hint">整理前选一个模板，决定整理与总结的侧重点。选中后可在下面编辑字段：会议背景、常用词语（让模型按这些词纠正识别错误的人名/术语）、总结方向、内容、框架。内置 普通会议 / 周会 / 访谈采访 / 项目管理 作参考，可改可加。</p>
+        <div class="tpl-list-row">
+          <select id="tpl-select" aria-label="选择模板"></select>
+          <button id="tpl-new-btn" class="mini" type="button">新建</button>
+          <button id="tpl-del-btn" class="mini" type="button">删除</button>
+        </div>
+        <div class="tpl-fields">
+          <label class="tpl-field">名称<input id="tpl-name" type="text"></label>
+          <label class="tpl-field">会议背景<textarea id="tpl-background" rows="2" placeholder="这类会议的一般背景"></textarea></label>
+          <label class="tpl-field">常用词语<textarea id="tpl-terms" rows="2" placeholder="人名、产品名、术语，逗号或换行分隔"></textarea></label>
+          <label class="tpl-field">总结方向<textarea id="tpl-direction" rows="2" placeholder="这次总结想突出什么"></textarea></label>
+          <label class="tpl-field">总结内容<textarea id="tpl-content" rows="2" placeholder="希望覆盖哪些内容"></textarea></label>
+          <label class="tpl-field">总结框架<textarea id="tpl-framework" rows="2" placeholder="希望的输出结构"></textarea></label>
+        </div>
+        <div id="templates-result" class="settings-result"></div>
+        <div class="modal-actions"><button id="templates-save-btn" class="primary" type="button">保存模板</button></div>
+      </div>
+
+      <div class="spanel" data-spanel="server">
+        <h4 class="ssection">语音识别模型</h4>
+        <div id="asr-status-line" class="hint">加载中…</div>
+        <div class="modal-actions">
+          <button id="asr-refresh-btn" class="mini" type="button">刷新</button>
+          <button id="asr-unload-btn" class="mini" type="button">立即释放内存</button>
+        </div>
+        <div id="asr-result" class="settings-result"></div>
+
+        <hr class="ssep">
+        <h4 class="ssection">网络端口</h4>
+        <p class="hint">端口号和监听地址改动后<b>需重启服务</b>才生效；自动释放时间保存后立即生效。</p>
+        <div class="server-row">
+          <label style="flex:1">监听地址<span class="def">默认 0.0.0.0，一般不用改</span><input id="srv-host" type="text" placeholder="0.0.0.0"></label>
+          <label style="width:130px">端口号<span class="def">默认 8000</span><input id="srv-port" type="number" min="1" max="65535" placeholder="8000"></label>
+        </div>
+        <label>空闲多久自动释放模型内存（分钟）<span class="def">默认 30 分钟，填 0 表示永不释放</span><input id="srv-idle" type="number" min="0" placeholder="30"></label>
+        <div class="modal-actions">
+          <button id="srv-check-btn" class="mini" type="button">检测端口能否使用</button>
+          <button id="srv-save-btn" class="primary" type="button">保存</button>
+        </div>
+        <div id="srv-result" class="settings-result"></div>
+      </div>
+
+      <div class="modal-actions bottom">
+        <button id="settings-close-btn" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="dlg-modal" class="modal hidden">
+    <div class="modal-card dlg-card">
+      <h3 id="dlg-title"></h3>
+      <div id="dlg-body"></div>
+      <div id="dlg-actions" class="modal-actions"></div>
+    </div>
+  </div>
+
+  <div id="msg-modal" class="modal hidden" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal-card dlg-card">
+      <h3 id="msg-title">提示</h3>
+      <div id="msg-body"></div>
+      <div id="msg-actions" class="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/static/access.js?v=1"></script>
+  <script src="/static/common.js?v=5"></script>
+  <script src="/static/app.js?v=24"></script>
+</body>
+</html>

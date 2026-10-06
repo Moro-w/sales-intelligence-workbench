@@ -1,0 +1,505 @@
+import asyncio
+import time
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from app import asr, audio, llm, storage
+
+_tasks: dict[str, dict] = {}
+# P1: 这把锁只护 ASR 模型单例（asr.transcribe 不能并发，会破坏模型内部 cache/state）。
+# convert(ffmpeg)/polish/summarize(LLM) 都不需要它——放开后多文件批处理时，文件 N
+# 的 convert 可与文件 N-1 的 ASR 并行，吞吐显著提升。锁只在 _run_asr 内部获取。
+_asr_lock = asyncio.Lock()
+# 并发 ffmpeg 上限：批处理一次传几十个文件时，避免同时 spawn 几十个 ffmpeg 进程。
+_CONVERT_SEM = asyncio.Semaphore(3)
+
+# B8: 常驻进程里每个 register_task 都往 _tasks 塞且从不清理，跑几周/几百个会议后
+# 内存堆几百个 task dict（各带 ≤300 logs）。设上限，注册时清理最旧的终态 task。
+_MAX_TASKS = 256
+_TERMINAL_STATUSES = {"done", "error", "asr_done"}
+
+CONVERT_END = 5
+ASR_FAKE_END = 50
+ASR_REAL_END = 55
+POLISH_START = 55
+POLISH_END = 80
+SUMMARY_END = 94
+TOPICS_END = 100
+
+# B10: 进度条 ETA 用的 ASR 实时率（每秒音频耗多少秒识别）。写死 0.25 是 GPU 实测值，
+# 在 CPU/Mac 上严重低估（实测 RTF≈4.7），进度条会"假完成"。按 device 给不同 RTF。
+_rtf_cache: float | None = None
+
+
+def _asr_rtf() -> float:
+    global _rtf_cache
+    if _rtf_cache is not None:
+        return _rtf_cache
+    try:
+        import torch
+        if torch.cuda.is_available():
+            rtf = 0.025
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            rtf = 0.25
+        else:
+            rtf = 4.7
+    except Exception:
+        rtf = 0.25
+    _rtf_cache = rtf
+    return rtf
+
+
+def estimate_total_seconds(duration_ms: int) -> float:
+    return duration_ms / 1000 * _asr_rtf()
+
+
+def _prune_tasks() -> None:
+    """Keep _tasks bounded. Evicts oldest terminal tasks first; never drops a
+    busy (in-flight) task unless there are more than _MAX_TASKS busy at once."""
+    if len(_tasks) <= _MAX_TASKS:
+        return
+    for tid in list(_tasks.keys()):  # dict keeps insertion order
+        if len(_tasks) <= _MAX_TASKS:
+            break
+        if _tasks[tid].get("status") in _TERMINAL_STATUSES:
+            del _tasks[tid]
+    while len(_tasks) > _MAX_TASKS:  # still over: too many busy, drop oldest
+        del _tasks[next(iter(_tasks))]
+
+
+def register_task(meeting_id: str) -> dict:
+    task_id = uuid.uuid4().hex
+    state = {
+        "task_id": task_id,
+        "meeting_id": meeting_id,
+        "status": "pending",
+        "progress": 0,
+        "step": "",
+        "error": None,
+        "started_at": 0.0,
+        "estimated_total_s": 0.0,
+        "logs": [],
+    }
+    _tasks[task_id] = state
+    _prune_tasks()
+    return state
+
+
+def latest_task_id(meeting_id: str) -> Optional[str]:
+    """Most recently registered task for a meeting (a meeting may accumulate
+    several tasks across resume/retry — the newest one is the live one)."""
+    for tid, st in reversed(list(_tasks.items())):
+        if st["meeting_id"] == meeting_id:
+            return tid
+    return None
+
+
+def get_progress(task_id: str) -> Optional[dict]:
+    state = _tasks.get(task_id)
+    if state is None:
+        return None
+    return {
+        "status": state["status"],
+        "progress": state["progress"],
+        "step": state["step"],
+        "error": state["error"],
+    }
+
+
+def update(task_id: str, **fields) -> None:
+    if task_id in _tasks:
+        _tasks[task_id].update(fields)
+
+
+def append_log(meeting_id: str, level: str, msg: str) -> None:
+    entry = {"ts": time.time(), "level": level, "msg": msg}
+    try:
+        storage.append_log_line(meeting_id, entry)
+    except Exception:
+        pass
+    matched = [st for st in _tasks.values() if st["meeting_id"] == meeting_id]
+    for st in matched:
+        st["logs"].append(entry)
+        if len(st["logs"]) > 300:
+            st["logs"] = st["logs"][-300:]
+
+
+def get_logs(meeting_id: str) -> dict:
+    tid = latest_task_id(meeting_id)
+    if tid is not None:
+        st = _tasks[tid]
+        return {"status": st["status"], "progress": st["progress"], "step": st["step"], "logs": st["logs"]}
+    meta = storage.get_meeting(meeting_id)
+    status = meta["meta"]["status"] if meta else "unknown"
+    logs = storage.read_log_lines(meeting_id)
+    progress = 100 if status == "done" else (ASR_REAL_END if status == "asr_done" else 0)
+    return {"status": status, "progress": progress, "step": "", "logs": logs}
+
+
+def _log_cb(meeting_id: str):
+    def cb(level, msg):
+        append_log(meeting_id, level, msg)
+    return cb
+
+
+def _resolve_template_hint(tpl_id: str, purpose: str = "summarize") -> str:
+    if not tpl_id:
+        return ""
+    for t in storage.load_templates():
+        if t.get("id") == tpl_id:
+            return llm.template_prompt_block(t, purpose=purpose)
+    return ""
+
+
+def advance_asr_progress(task_id: str, elapsed_s: float) -> None:
+    state = _tasks.get(task_id)
+    if not state or state.get("estimated_total_s", 0) <= 0:
+        return
+    ratio = min(elapsed_s / state["estimated_total_s"], 1.0)
+    fake_progress = CONVERT_END + int((ASR_FAKE_END - CONVERT_END) * ratio)
+    state["progress"] = max(state["progress"], fake_progress)
+
+
+def _fmt_dur(sec: float) -> str:
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    return f"{m}m{s}s"
+
+
+def _record_timing(meeting_id: str, stage: str, elapsed: float) -> None:
+    data = storage.get_meeting(meeting_id)
+    if not data:
+        return
+    timings = (data.get("meta") or {}).get("timings") or {}
+    timings[stage] = round(elapsed, 1)
+    storage.update_meta(meeting_id, timings=timings)
+
+
+def _log_stage_summary(meeting_id: str, title: str, *stages) -> None:
+    data = storage.get_meeting(meeting_id)
+    timings = (data.get("meta") or {}).get("timings") or {} if data else {}
+    parts = [f"{label} {_fmt_dur(timings.get(key, 0))}" for key, label in stages]
+    total = sum(timings.get(k, 0) for k, _ in stages)
+    append_log(meeting_id, "info", f"{title}: {' · '.join(parts)} · 共 {_fmt_dur(total)}")
+
+
+async def run_pipeline(meeting_id: str, cfg, task_id: Optional[str] = None) -> None:
+    # P1: 锁不再包住整条 pipeline（见 _asr_lock 注释）。convert/ASR 顺序执行本就不重叠，
+    # 但去掉外层锁后，多个会议的 pipeline 可交错：文件 N 的 convert 能与文件 N-1 的 ASR 并行。
+    if task_id is None:
+        task_id = latest_task_id(meeting_id) or register_task(meeting_id)["task_id"]
+    try:
+        await _convert_audio(task_id, meeting_id, cfg)
+        await _run_asr(task_id, meeting_id, cfg)
+        storage.update_meta(meeting_id, status="asr_done")
+        update(task_id, status="asr_done", progress=ASR_REAL_END, step="识别完成，待整理")
+        _log_stage_summary(meeting_id, "识别阶段完成", ("convert", "转换"), ("asr", "识别"))
+    except Exception as e:
+        storage.update_meta(meeting_id, status="error", error=str(e))
+        update(task_id, status="error", error=str(e), step="失败")
+
+
+async def _convert_audio(task_id, meeting_id, cfg) -> None:
+    update(task_id, status="converting", progress=0, step="音频转换")
+    append_log(meeting_id, "info", "音频转换: 转为 16kHz wav ...")
+    mdir = storage.meeting_dir(meeting_id)
+    meta = storage.get_meeting(meeting_id)["meta"]
+    src = mdir / meta["audio_file"]
+    dst = mdir / "audio_wav.wav"
+    loop = asyncio.get_running_loop()
+    # P1: ffmpeg/ffprobe 是阻塞 subprocess，必须丢到线程池执行——否则会卡住整个事件
+    # 循环。解锁后多 pipeline 并发时尤其致命：一个 convert 会冻住所有 HTTP/WS 与别的
+    # pipeline 的 ASR await。同时用 _CONVERT_SEM 限制并发 ffmpeg 数量。
+    t0 = time.time()
+    async with _CONVERT_SEM:
+        await loop.run_in_executor(None, audio.convert_to_wav, str(src), str(dst))
+    convert_s = time.time() - t0
+    duration_ms = await loop.run_in_executor(None, audio.get_duration_ms, str(dst))
+    append_log(meeting_id, "info", f"音频转换完成: 时长 {duration_ms/1000:.0f}s（耗时 {convert_s:.1f}s）")
+    storage.update_meta(
+        meeting_id,
+        audio_wav="audio_wav.wav",
+        duration_ms=duration_ms,
+    )
+    _record_timing(meeting_id, "convert", convert_s)
+    update(task_id, progress=CONVERT_END, started_at=time.time(),
+           estimated_total_s=estimate_total_seconds(duration_ms))
+
+
+async def _run_asr(task_id, meeting_id, cfg) -> None:
+    update(task_id, status="asr_running", step="语音识别")
+    mdir = storage.meeting_dir(meeting_id)
+    wav = str(mdir / "audio_wav.wav")
+    loop = asyncio.get_running_loop()
+    # P1: 模型单例互斥。排队等待时给个"排队"提示（不跑 fake ticker，避免空等时进度虚增）；
+    # 拿到锁后才真正开始识别并计时。
+    if asr.is_busy():
+        update(task_id, step="排队等待识别")
+        append_log(meeting_id, "info", "前面有任务正在识别，排队中…")
+    async with _asr_lock:
+        update(task_id, step="语音识别")
+        stop_fake = asyncio.Event()
+
+        async def fake_ticker():
+            start = time.time()
+            while not stop_fake.is_set():
+                await asyncio.sleep(2)
+                advance_asr_progress(task_id, time.time() - start)
+
+        ticker = asyncio.create_task(fake_ticker())
+        t0 = time.time()
+        try:
+            raw = await loop.run_in_executor(None, asr.transcribe, wav, cfg.asr, _log_cb(meeting_id))
+        finally:
+            stop_fake.set()
+            await ticker
+    asr_s = time.time() - t0
+    storage.save_raw(meeting_id, raw)
+    storage.update_meta(meeting_id, spk_count=raw.get("spk_count", 0))
+    _record_timing(meeting_id, "asr", asr_s)
+    update(task_id, progress=ASR_REAL_END)
+
+
+async def _run_polish(task_id, meeting_id, cfg) -> None:
+    update(task_id, status="llm_polishing", step="LLM 整理", progress=POLISH_START)
+    data = storage.get_meeting(meeting_id)
+    if not data["raw"]:
+        raise RuntimeError("raw.json missing, cannot polish")
+    sentences = data["raw"]["sentences"]
+    meta = data.get("meta") or {}
+    ctx = meta.get("meeting_context") or ""
+    hint = _resolve_template_hint(meta.get("template") or "", purpose="polish")
+    loop = asyncio.get_running_loop()
+    def on_prog(frac):
+        update(task_id, progress=int(POLISH_START + frac * (POLISH_END - POLISH_START)))
+    quality = {}
+    def on_quality(info):
+        quality.update(info)
+    t0 = time.time()
+    md = await loop.run_in_executor(None, llm.polish, sentences, cfg.llm, _log_cb(meeting_id), on_prog, ctx, hint, on_quality)
+    storage.save_processed(meeting_id, md)
+    if quality.get("flagged"):
+        msg = (f"整理稿与原文几乎一致（{quality['flagged']}/{quality['total']} 段相似度 "
+               f"{quality['similarity']:.0%}），模型疑似未实际整理。"
+               "建议：到「设置」更换更强的模型（如 API 模式）后，点「重新整理」重试。")
+        # 新告警要重新弹出：上一次用户点过关闭不代表这次也看过
+        storage.update_meta(meeting_id, polish_warning=msg, polish_warning_dismissed=False)
+    elif "flagged" in quality:
+        storage.update_meta(meeting_id, polish_warning=None, polish_warning_dismissed=False)
+    _record_timing(meeting_id, "polish", time.time() - t0)
+    update(task_id, progress=POLISH_END)
+
+
+async def _run_summarize(task_id, meeting_id, cfg) -> None:
+    update(task_id, status="llm_summarizing", step="LLM 总结", progress=POLISH_END)
+    data = storage.get_meeting(meeting_id)
+    processed = data["processed"] or ""
+    meta = data.get("meta") or {}
+    ctx = meta.get("meeting_context") or ""
+    hint = _resolve_template_hint(meta.get("template") or "")
+    loop = asyncio.get_running_loop()
+    t0 = time.time()
+    result = await loop.run_in_executor(None, llm.summarize, processed, cfg.llm, _log_cb(meeting_id), ctx, hint)
+    if isinstance(result, dict):
+        storage.save_summary_json(meeting_id, result)
+        storage.save_summary(meeting_id, llm.summary_to_md(result))
+    else:
+        storage.save_summary(meeting_id, result)
+        storage.save_summary_json(meeting_id, None)
+    _record_timing(meeting_id, "summarize", time.time() - t0)
+    update(task_id, progress=SUMMARY_END)
+
+
+async def _run_topics(task_id, meeting_id, cfg, force: bool = False) -> None:
+    """3.3 议题时间轴：整理流程的收尾阶段（也可单独触发）。挂在 summarize 之后、
+    非交互等待；失败只记 warn 不影响纪要与 done 状态。用户手动编辑过（manual）
+    则跳过，除非显式 force（详情页「重新生成」确认覆盖）。"""
+    data = storage.get_meeting(meeting_id)
+    if not data:
+        return
+    sentences = (data.get("raw") or {}).get("sentences") or []
+    if not sentences:
+        return
+    existing = storage.load_topics(meeting_id)
+    if existing and existing.get("manual") and not force:
+        append_log(meeting_id, "info", "议题时间轴已有手动修改，跳过自动生成（如需覆盖请在详情页点「重新生成」）")
+        return
+    storage.update_meta(meeting_id, status="llm_topics")
+    update(task_id, status="llm_topics", step="生成议题时间轴", progress=SUMMARY_END)
+    loop = asyncio.get_running_loop()
+    t0 = time.time()
+    segs = await loop.run_in_executor(None, llm.segment_topics, sentences, cfg.llm, _log_cb(meeting_id))
+    _record_timing(meeting_id, "topics", time.time() - t0)
+    if segs:
+        storage.save_topics(meeting_id, {
+            "segments": segs, "manual": False,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        append_log(meeting_id, "info", f"议题时间轴生成完成：共 {len(segs)} 段议题")
+        update(task_id, progress=TOPICS_END)
+    else:
+        append_log(meeting_id, "warn", "议题时间轴生成失败（模型未返回有效分段），可在详情页重试或手动编辑")
+        update(task_id, progress=TOPICS_END)
+
+
+async def retry_llm(meeting_id: str, cfg, task_id: Optional[str] = None) -> str:
+    if task_id is None:
+        task_id = register_task(meeting_id)["task_id"]
+    # P1: polish+summarize 走外部 LLM（无模型单例互斥），不需要 _asr_lock；多会议可并发整理。
+    try:
+        await _run_polish(task_id, meeting_id, cfg)
+        await _run_summarize(task_id, meeting_id, cfg)
+        try:
+            await _run_topics(task_id, meeting_id, cfg)
+        except Exception as e:
+            # 议题分段是渐进增强：失败不拖垮整理结果
+            append_log(meeting_id, "warn", f"议题时间轴生成出错（不影响纪要）：{e}")
+            update(task_id, progress=TOPICS_END)
+        storage.update_meta(meeting_id, status="done", error=None)
+        update(task_id, status="done", progress=100, step="完成")
+        _log_stage_summary(meeting_id, "整理完成",
+                           ("convert", "转换"), ("asr", "识别"), ("polish", "整理"), ("summarize", "总结"))
+    except Exception as e:
+        storage.update_meta(meeting_id, status="error", error=str(e))
+        update(task_id, status="error", error=str(e))
+    return task_id
+
+
+async def generate_topics(meeting_id: str, cfg, task_id: Optional[str] = None, force: bool = False) -> str:
+    """单独触发议题生成（详情页「生成议题时间轴 / 重新生成」）。
+    不改变会议本身的终态：跑完恢复原 status，失败只标记 task。"""
+    if task_id is None:
+        task_id = register_task(meeting_id)["task_id"]
+    data = storage.get_meeting(meeting_id)
+    prev_status = (data.get("meta") or {}).get("status") if data else None
+    restore = prev_status if prev_status in ("done", "asr_done") else "done"
+    try:
+        await _run_topics(task_id, meeting_id, cfg, force=force)
+        storage.update_meta(meeting_id, status=restore, error=None)
+        update(task_id, status="done", progress=100, step="完成")
+    except Exception as e:
+        storage.update_meta(meeting_id, status=restore, error=None)
+        update(task_id, status="error", error=str(e))
+    return task_id
+
+
+async def finalize_live(meeting_id: str, result: dict, pcm: bytes, sample_rate: int, cfg,
+                        task_id: Optional[str] = None) -> None:
+    """Live stream stopped: persist audio + streaming transcript immediately,
+    then upgrade with an offline second pass in the background.
+
+    The offline pass cold-loads the model (minutes on first run) and can stall
+    for a long time on a wedged GPU — the user must see their transcript and a
+    settled status the moment the meeting ends, not when the offline pass
+    finishes. If the refinement fails or times out, the streaming-quality
+    fallback stays on disk and the meeting still lands on asr_done.
+    """
+    t0 = time.time()
+    fname = storage.save_live_audio(meeting_id, pcm, sample_rate)
+    duration_ms = (len(pcm) // 2) * 1000 // sample_rate
+
+    # Fallback raw.json from the streaming engine. Its sentences all carry
+    # spk=0 and estimated timestamps — B12: don't derive spk_count from a set
+    # of zeros, that would wrongly report 1 speaker.
+    sentences = result.get("sentences") or []
+    storage.save_raw(meeting_id, {
+        "text": "".join(s.get("text", "") for s in sentences),
+        "sentences": sentences,
+        "spk_count": 0,
+    })
+    storage.update_meta(
+        meeting_id,
+        status="asr_done",
+        audio_file=fname,
+        audio_wav=fname,
+        duration_ms=duration_ms,
+        spk_count=0,
+        live_refined=False,
+    )
+    _record_timing(meeting_id, "live", time.time() - t0)
+    append_log(meeting_id, "info",
+               f"实时记录已保存（{duration_ms / 1000:.0f}s，流式 {len(sentences)} 句），正在后台进行二次识别…")
+
+    refine = asyncio.create_task(_refine_live(meeting_id, fname, duration_ms, cfg, task_id))
+    _live_refine_tasks.add(refine)
+    refine.add_done_callback(_live_refine_tasks.discard)
+
+
+# Strong refs to in-flight refinement tasks: asyncio keeps only weakrefs to
+# tasks, so a GC pass could silently collect a refinement that still runs.
+_live_refine_tasks: set = set()
+
+# Bounds for the refinement wait. Generous on purpose: cold model load plus
+# slow devices are legit; the timeout only catches pathological native stalls.
+_REFINE_TIMEOUT_FLOOR = 2700.0   # 45min: cold load ~4min + slow-device margin
+_REFINE_TIMEOUT_CAP = 7200.0     # 2h: even CPU gets there; beyond that it's hung
+
+
+async def _refine_live(meeting_id: str, fname: str, duration_ms: int, cfg,
+                       task_id: Optional[str]) -> None:
+    """Offline second pass on the saved live wav; upgrades raw.json in place.
+
+    While it runs the meeting shows 识别中 (asr_running) and the fallback
+    transcript is already visible; on success the page auto-reloads into the
+    refined transcript (poll hits the asr_done terminal). A native GPU stall
+    cannot be interrupted in-process — the wait_for timeout only bounds how
+    long we leave the status on asr_running; the fallback data is already
+    safe either way.
+    """
+    if task_id is None:
+        task_id = register_task(meeting_id)["task_id"]
+    update(task_id, status="asr_running", step="实时二次识别")
+    storage.update_meta(meeting_id, status="asr_running")
+    mdir = storage.meeting_dir(meeting_id)
+    wav_path = str(mdir / fname)
+    loop = asyncio.get_running_loop()
+    # Generous on purpose: cold model load + slow devices are legit; the
+    # timeout only catches pathological native stalls.
+    timeout = min(max(_REFINE_TIMEOUT_FLOOR, estimate_total_seconds(duration_ms) * 4),
+                  _REFINE_TIMEOUT_CAP)
+    t0 = time.time()
+    try:
+        raw = await asyncio.wait_for(
+            loop.run_in_executor(None, asr.transcribe, wav_path, cfg.asr, _log_cb(meeting_id)),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        asr.clear_busy()  # worker thread never comes back; reset the phantom flag
+        append_log(meeting_id, "error",
+                   f"实时离线二次识别超时（>{timeout:.0f}s），已保留实时识别结果；可点「恢复任务」重试")
+        update(task_id, status="error", error="二次识别超时", step="二次识别超时")
+        storage.update_meta(meeting_id, status="asr_done")
+        return
+    except Exception as e:
+        append_log(meeting_id, "warn", f"实时离线二次识别失败：{e}，已保留实时识别结果")
+        update(task_id, status="error", error=str(e), step="二次识别失败")
+        storage.update_meta(meeting_id, status="asr_done")
+        return
+    storage.save_raw(meeting_id, raw)
+    storage.update_meta(meeting_id, status="asr_done",
+                        spk_count=raw.get("spk_count", 0), live_refined=True)
+    _record_timing(meeting_id, "live_asr", time.time() - t0)
+    append_log(meeting_id, "info",
+               f"二次识别完成：{len(raw.get('sentences', []))} 句，{raw.get('spk_count', 0)} 位说话人"
+               f"（耗时 {time.time() - t0:.0f}s）")
+    update(task_id, status="asr_done", progress=ASR_REAL_END, step="识别完成，待整理")
+
+
+async def recover_live(meeting_id: str, cfg, task_id: Optional[str] = None) -> str:
+    """Re-run the offline second pass for a live meeting whose wav was saved
+    but whose refinement never completed (service restart / native stall).
+
+    Wraps run_pipeline so meta.live_refined gets set; without that flag the
+    meeting would keep matching the "needs refinement" resume branch on every
+    cron pass and re-queue itself forever.
+    """
+    if task_id is None:
+        task_id = register_task(meeting_id)["task_id"]
+    await run_pipeline(meeting_id, cfg, task_id)
+    data = storage.get_meeting(meeting_id)
+    if data and (data.get("meta") or {}).get("status") == "asr_done":
+        storage.update_meta(meeting_id, live_refined=True, error=None)
+    return task_id

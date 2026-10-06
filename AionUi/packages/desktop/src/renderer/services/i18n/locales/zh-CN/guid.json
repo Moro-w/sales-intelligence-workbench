@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "试试这些销售指令",
+  "defaultPrompts": {
+    "understand": "帮我写一封会后跟进邮件：感谢客户沟通、回顾需求要点、确认下一步安排",
+    "cleanup": "帮我准备一份客户演示提纲：客户关注点、演示顺序、可能被问到的问题和回答",
+    "create": "客户说预算还没审批，帮我想几种推进思路和下一步该做的事"
+  },
+  "selectAssistantHint": "选择一位助手开始任务",
+  "workspace": {
+    "workInProject": "在项目中工作",
+    "optional": "可选",
+    "clearWorkspace": "清除",
+    "specifyWorkspace": "选择项目文件夹",
+    "searchPlaceholder": "搜索项目…",
+    "noProject": "不使用项目"
+  }
+}

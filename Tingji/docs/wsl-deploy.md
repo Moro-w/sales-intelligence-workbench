@@ -1,0 +1,260 @@
+# Windows + WSL2 + GPU 部署指南
+
+本文档说明在 Windows 11 上通过 WSL2 部署 FunASR 会议转录系统，并用 NVIDIA GPU 加速推理。
+
+## 1. 前置检查
+
+### Windows 版本
+
+Windows 10 21H2 及以上 / Windows 11。WSL2 需要内核版本 5.10+。
+
+### GPU（可选但强烈推荐）
+
+- NVIDIA GPU，显存 >= 6GB（运行 paraformer-zh + cam++ 峰值约 4GB）
+- 装好 **Windows 版** NVIDIA 驱动（>= 535）。驱动走 Windows，WSL2 自动直通，**不要**在 WSL 里单独装 CUDA 驱动
+- 验证驱动直通成功：在 WSL 里跑 `nvidia-smi`，能看到 GPU 和驱动版本就 OK
+
+## 2. 安装 WSL2 + Ubuntu
+
+以管理员身份开 PowerShell：
+
+```powershell
+wsl --install -d Ubuntu-22.04
+wsl --set-default-version 2
+```
+
+重启后进入 Ubuntu，设置用户名密码。
+
+确认是 WSL2（不是 WSL1）：
+
+```powershell
+wsl -l -v
+# VERSION 列必须是 2
+```
+
+## 3. WSL 内的基础环境
+
+在 Ubuntu shell 里：
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg git git-lfs
+git lfs install
+
+# Python 3.11（Ubuntu 22.04 自带 3.10，需要额外装 3.11）
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt install -y python3.11 python3.11-venv python3.11-dev
+
+# uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc
+```
+
+## 4. 拉代码 + 下载模型
+
+```bash
+git clone https://github.com/baigong-ai/Tingji.git funasr
+cd funasr
+
+cp config.yaml.example config.yaml
+# 确认 server.host 是 "0.0.0.0"（默认就是）
+
+bash scripts/download_models.sh   # 约 1.3GB，走 git，可靠
+```
+
+## 5. 装 CUDA 版 PyTorch
+
+`pyproject.toml` 默认拉的是 CPU 版 torch。要用 GPU 必须覆盖：
+
+```bash
+uv venv --python 3.11
+source .venv/bin/activate
+
+# 先装项目其余依赖（会装 CPU 版 torch）
+uv pip install -e .
+
+# 再用 CUDA 12.1 版 torch 覆盖
+uv pip install --reinstall \
+  torch torchaudio \
+  --index-url https://download.pytorch.org/whl/cu121
+```
+
+如果你的 CUDA 版本不是 12.1，去 https://pytorch.org/get-started/locally/ 查对应 wheel。常见映射：
+
+| Windows 驱动 CUDA | torch index-url |
+|---|---|
+| 12.1 - 12.6 | `cu121`（兼容） |
+| 11.8 | `cu118` |
+
+验证 GPU 可用：
+
+```bash
+python -c "import torch; print('cuda:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
+```
+
+期望输出：`cuda: True | NVIDIA GeForce RTX xxxx`
+
+## 6. 启动服务
+
+```bash
+./run.sh
+```
+
+启动日志里会看到设备信息，例如：
+
+```
+loading FunASR models from ./models (hub=ms, device=cuda:0)...
+```
+
+如果看到 `device=cpu`，说明 torch 没装 CUDA 版，回到第 5 步。
+
+## 7. 实时流式转写（v0.4）
+
+WSL + GPU 上支持标准模式实时流式转写：
+
+| 模式 | 说明 | 是否需要额外服务 | 可用状态 |
+|---|---|---|---|
+| **标准模式** | 内置 `paraformer-zh-streaming` 流式引擎，直接可用 | 否 | v0.4 可用 |
+| **增强模式** | 转发到 Fun-ASR-Nano vLLM GPU sidecar，方言/口音/远场更准 | 需单独启动 sidecar | **v0.5 提供** |
+
+标准模式无需配置，在首页点「实时记录」即可开始。
+
+### 增强模式 sidecar 部署（v0.5）
+
+> **增强模式将在 v0.5 中提供**。下面的部署说明仅作预览，当前版本无需执行。
+
+增强模式需要单独启动一个 GPU sidecar 服务，默认监听 `ws://localhost:10095`。
+
+**环境要求（比主项目更高）**：
+- CUDA 12.6+（当前 Fun-ASR-Nano 需要 torch>=2.9、vllm>=0.12）
+- NVIDIA 独显 8GB+ 显存（推荐 12GB+）
+- 额外约 2.1GB 模型下载（`FunAudioLLM/Fun-ASR-Nano-2512`）
+
+**部署步骤示例**（在 WSL 里新建独立目录，避免和主项目依赖冲突）：
+
+```bash
+cd ~
+git clone --depth 1 https://github.com/FunAudioLLM/Fun-ASR.git
+git clone --depth 1 https://github.com/modelscope/FunASR.git FunASR-git
+
+mkdir -p funasr-sidecar && cd funasr-sidecar
+uv venv --python 3.12
+source .venv/bin/activate
+
+# 安装 CUDA 12.6 版 torch（按你的 CUDA 版本调整 index-url）
+uv pip install torch==2.9.0+cu126 torchaudio==2.9.0+cu126 \
+  --index-url https://download.pytorch.org/whl/cu126
+
+# 安装 vllm、funasr 源码及其依赖
+uv pip install 'vllm>=0.12.0' websockets regex
+uv pip install -e ~/FunASR-git
+
+# 启动 sidecar（加载约 2.1GB 模型）
+export PYTHONPATH="$HOME/FunASR-git:$PYTHONPATH"
+python ~/Fun-ASR/serve_realtime_ws.py \
+  --port 10095 --device cuda:0 --gpu-memory-utilization 0.6 --disable-spk
+```
+
+**听记切换到增强模式**：
+
+编辑 `config.yaml`：
+
+```yaml
+asr:
+  stream_engine: sidecar
+  sidecar_url: ws://localhost:10095
+```
+
+或进「设置 → 语音识别」切换（如界面已暴露该选项）。
+
+> 注意：WSL 当前若是 CUDA 12.1 + torch 2.5，无法直接运行 Fun-ASR-Nano vLLM sidecar；需先升级 CUDA 工具链到 12.6+ 并安装对应 torch/vllm。
+
+## 8. 访问服务
+
+### 从 Windows 本机
+
+WSL2 默认会把服务端口转发到 Windows 的 localhost。直接在浏览器开：
+
+```
+http://localhost:8000
+```
+
+首页顶部"访问地址"卡片会显示 URL，复制即用。
+
+### 从局域网其他机器
+
+WSL2 是 NAT 模式，局域网机器默认访问不到 WSL。需要在 **Windows** 上开 portproxy。以管理员身份开 PowerShell：
+
+```powershell
+# 查 WSL 子系统的 IP
+wsl hostname -I
+# 输出例如: 172.20.50.123
+
+# 设 portproxy（把上面的 IP 填进去）
+netsh interface portproxy add v4tov4 `
+  listenport=8000 listenaddress=0.0.0.0 `
+  connectport=8000 connectaddress=172.20.50.123
+
+# 防火墙开 8000
+New-NetFirewallRule -DisplayName "FunASR WSL" -Direction Inbound `
+  -Action Allow -Protocol TCP -LocalPort 8000
+
+# 查看已设规则
+netsh interface portproxy show v4tov4
+```
+
+然后在其他机器用 `http://<Windows主机IP>:8000` 访问。
+
+注意：WSL 每次重启 IP 可能变化，重启后可能需要重设 portproxy。可以写成开机脚本。
+
+### 查 Windows 主机 IP
+
+```powershell
+ipconfig | findstr IPv4
+```
+
+## 9. 性能参考
+
+GPU 推理速度（实测 RTX 4060 Ti，81 分钟中文音频）：
+
+- ASR（paraformer + VAD + cam++）：约 2 分钟（RTF ≈ 0.025，识别速度约为实时的 40 倍）
+- LLM 整理 + 总结：取决于 LLM 后端
+  - 本地 Ollama（Qwen3:8b gguf）：约 5-8 分钟
+  - API（GLM/DeepSeek）：1-2 分钟
+  - **WSL/NVIDIA 上不要用 `*-mlx`**：mlx 是 Apple Silicon 专用后端，在 NVIDIA/WSL 上后端不匹配（跑不动，非性能问题），用 gguf 版本
+
+总耗时约 7-10 分钟。CPU 模式 ASR 慢得多（RTF ≈ 0.25，约为音频时长的 1/4），长音频务必用 GPU。
+
+> 注：`app/asr.py` 必须把 `device` 显式传给 FunASR `AutoModel`，否则即使装了 CUDA 版 torch 也会默认跑 CPU（RTF 飙到 4 以上）。
+
+## 10. 故障排查
+
+### `nvidia-smi` 在 WSL 里找不到
+
+- Windows NVIDIA 驱动版本太旧，升级到最新
+- WSL 内核太旧，`wsl --update`
+- 确认是 WSL2 不是 WSL1：`wsl -l -v`
+
+### torch.cuda.is_available() 返回 False
+
+- `nvidia-smi` 通了但 torch 不行 → torch 装成了 CPU 版
+- 解决：`uv pip install --reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu121`
+- 别用 `sudo`，别混系统 Python 和 venv
+
+### funasr 加载时卡在 "loading models"
+
+模型没下载完整。`du -sh models/*` 看大小，paraformer-zh 应该约 950MB。如果只有几 KB，重跑 `bash scripts/download_models.sh`。
+
+### 局域网访问 404 / 超时
+
+- WSL 里 `curl http://localhost:8000` 能通 → 服务正常
+- Windows PowerShell 里 `curl http://localhost:8000` 能通 → WSL→Windows 转发正常
+- 局域网机器不通 → portproxy 或防火墙没设对，参考第 7 节
+
+### 想重置一切
+
+```powershell
+wsl --shutdown   # 关掉所有 WSL 实例
+# 在 WSL 里：rm -rf funasr/.venv funasr/models
+```

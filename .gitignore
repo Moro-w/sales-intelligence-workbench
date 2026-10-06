@@ -1,0 +1,17 @@
+# Local runtime: credentials, database, meeting data, budget ledger, logs. Never commit.
+.runtime/
+# Project-local toolchains, virtualenvs and caches.
+.tools/
+# Private product documents and materials are kept outside this repository.
+文档/
+执行规范/
+测试材料/
+.env
+.env.*
+!.env.example
+.DS_Store
+__pycache__/
+*.py[cod]
+node_modules/
+AionUi/out/
+target/

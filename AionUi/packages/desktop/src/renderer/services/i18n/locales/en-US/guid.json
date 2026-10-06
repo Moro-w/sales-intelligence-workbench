@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "Try these instructions",
+  "defaultPrompts": {
+    "understand": "Write a follow-up email after the meeting: thank the client, recap their key needs, and confirm next steps",
+    "cleanup": "Prepare a client demo outline: their priorities, demo order, and likely questions with answers",
+    "create": "The client says the budget isn't approved yet; suggest ways to move the deal forward and my next actions"
+  },
+  "selectAssistantHint": "Select an assistant to start a task",
+  "workspace": {
+    "workInProject": "Work in a project",
+    "optional": "Optional",
+    "clearWorkspace": "Clear",
+    "specifyWorkspace": "Select project folder",
+    "searchPlaceholder": "Search projects…",
+    "noProject": "No Project"
+  }
+}

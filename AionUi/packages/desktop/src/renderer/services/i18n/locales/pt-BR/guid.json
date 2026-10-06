@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "Experimente estas instruções",
+  "defaultPrompts": {
+    "understand": "Escreva um e-mail de acompanhamento após a reunião: agradecimento, resumo das necessidades e confirmação dos próximos passos",
+    "cleanup": "Prepare um roteiro de demonstração para o cliente: prioridades, ordem da demo e perguntas prováveis com respostas",
+    "create": "O orçamento do cliente ainda não foi aprovado; sugira formas de avançar a venda e minhas próximas ações"
+  },
+  "selectAssistantHint": "Selecione um assistente para iniciar uma tarefa",
+  "workspace": {
+    "workInProject": "Trabalhar em um projeto",
+    "optional": "Opcional",
+    "clearWorkspace": "Limpar",
+    "specifyWorkspace": "Selecionar pasta do projeto",
+    "searchPlaceholder": "Procurar projetos…",
+    "noProject": "Nenhum Projeto"
+  }
+}

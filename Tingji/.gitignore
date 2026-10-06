@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Project data & models
+data/
+models/
+*.wav
+*.m4a
+*.mp3
+*.flac
+*.ogg
+*.aac
+*.opus
+
+# Secrets
+.env
+.env.*
+!.env.example
+config.yaml
+dns_hosts.txt
+!.gitignore
+certs/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Runtime logs & local config
+nohup.out
+*.log
+logs/*.out
+logs/*.pid
+*.bak
+wsl/
+.claude/settings.local.json
+CLAUDE.md
+logs/
+
+# Internal-only docs (research, roadmap, planning — not for public repo)
+docs/internal/

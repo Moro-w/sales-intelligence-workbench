@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "Bu talimatları deneyin",
+  "defaultPrompts": {
+    "understand": "Toplantı sonrası takip e-postası yaz: teşekkür, temel ihtiyaçların özeti ve sonraki adımların teyidi",
+    "cleanup": "Müşteri demosu için bir taslak hazırla: müşterinin öncelikleri, demo sırası, olası sorular ve cevaplar",
+    "create": "Müşterinin bütçesi henüz onaylanmadı; satışı ilerletmenin yollarını ve sonraki adımlarımı öner"
+  },
+  "selectAssistantHint": "Göreve başlamak için bir asistan seçin",
+  "workspace": {
+    "workInProject": "Projede çalış",
+    "optional": "İsteğe bağlı",
+    "clearWorkspace": "Temizle",
+    "specifyWorkspace": "Proje klasörü seç",
+    "searchPlaceholder": "Proje ara…",
+    "noProject": "Proje Yok"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "試試這些指令",
+  "defaultPrompts": {
+    "understand": "幫我寫一封會後跟進郵件：感謝客戶溝通、回顧需求要點、確認下一步安排",
+    "cleanup": "幫我準備一份客戶演示提綱：客戶關注點、演示順序、可能被問到的問題和回答",
+    "create": "客戶說預算還沒審批，幫我想幾種推進思路和下一步該做的事"
+  },
+  "selectAssistantHint": "選擇一位助手開始任務",
+  "workspace": {
+    "workInProject": "在專案中工作",
+    "optional": "可選",
+    "clearWorkspace": "清除",
+    "specifyWorkspace": "選擇專案資料夾",
+    "searchPlaceholder": "搜尋專案…",
+    "noProject": "不使用專案"
+  }
+}

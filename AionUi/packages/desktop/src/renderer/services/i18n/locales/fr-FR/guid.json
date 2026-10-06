@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "Essayez ces exemples de prompts :",
+  "defaultPrompts": {
+    "understand": "Rédige un e-mail de suivi après la réunion : remerciements, rappel des besoins clés, confirmation des prochaines étapes",
+    "cleanup": "Prépare le plan d'une démo client : priorités du client, ordre de la démo, questions probables et réponses",
+    "create": "Le budget du client n'est pas encore approuvé ; propose des pistes pour faire avancer la vente et mes prochaines actions"
+  },
+  "selectAssistantHint": "Sélectionnez un assistant pour démarrer une tâche",
+  "workspace": {
+    "workInProject": "Travailler dans un projet",
+    "optional": "Facultatif",
+    "clearWorkspace": "Clair",
+    "specifyWorkspace": "Sélectionnez le dossier du projet",
+    "searchPlaceholder": "Rechercher des projets…",
+    "noProject": "Aucun projet"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "이 지시를 사용해 보세요",
+  "defaultPrompts": {
+    "understand": "미팅 후 후속 이메일을 써 줘: 감사 인사, 요구사항 요약, 다음 단계 확인",
+    "cleanup": "고객 데모 개요를 준비해 줘: 고객 관심사, 데모 순서, 예상 질문과 답변",
+    "create": "고객 예산이 아직 승인되지 않았어. 거래를 진전시킬 방법과 다음 할 일을 제안해 줘"
+  },
+  "selectAssistantHint": "어시스턴트를 선택하여 작업을 시작하세요",
+  "workspace": {
+    "workInProject": "프로젝트에서 작업",
+    "optional": "선택사항",
+    "clearWorkspace": "지우기",
+    "specifyWorkspace": "프로젝트 폴더 선택",
+    "searchPlaceholder": "프로젝트 검색…",
+    "noProject": "프로젝트 없음"
+  }
+}

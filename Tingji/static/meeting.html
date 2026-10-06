@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title id="m-page-title">会议 · 听记</title>
+  <link rel="stylesheet" href="/static/style.css?v=17">
+  <link rel="stylesheet" href="/static/meeting.css?v=22">
+</head>
+<body>
+  <header>
+    <a href="/" class="back-link" title="返回首页" aria-label="返回首页">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="15 18 9 12 15 6"/>
+      </svg>
+    </a>
+    <h1><a href="/" class="brand">听记</a></h1>
+    <span class="header-sep" aria-hidden="true">/</span>
+    <span id="m-title" class="header-doc-title">会议</span>
+    <div class="header-right">
+      <div id="access-info-slot" class="header-access hidden"></div>
+      <button id="log-btn" class="header-btn">日志</button>
+      <button id="settings-btn" class="header-btn">设置</button>
+    </div>
+  </header>
+  <main class="meeting-main">
+    <div class="meeting-meta">
+      <div class="meta-row">
+        <span id="m-meta"></span>
+        <div class="export-row">
+          <select id="export-format" aria-label="导出格式">
+            <option value="md">整理版 .md</option>
+            <option value="docx">整理版 .docx</option>
+            <option value="minutes">纪要 .md</option>
+            <option value="minutes_docx">纪要 .docx</option>
+            <option value="txt">原文 .txt</option>
+            <option value="srt">字幕 .srt</option>
+          </select>
+          <button id="export-btn" class="mini">导出</button>
+          <button id="retry-btn" class="retry-btn hidden">重试 LLM</button>
+          <button id="resume-btn" class="retry-btn hidden">恢复任务</button>
+        </div>
+      </div>
+      <div id="speakers-bar" class="speakers-bar"></div>
+      <div class="speaker-tools">
+        <button id="merge-speakers-btn" class="mini hidden" type="button">合并说话人</button>
+        <button id="merge-cancel-btn" class="mini hidden" type="button">取消合并</button>
+        <span id="merge-hint" class="merge-hint hidden"></span>
+      </div>
+      <div id="speaker-timeline" class="speaker-timeline" aria-label="发言人发言时长分布，点击定位"></div>
+      <div id="topic-timeline-wrap" class="topic-timeline-wrap hidden">
+        <div class="topic-head">
+          <span class="topic-label">议题</span>
+          <span id="topic-tools" class="topic-tools hidden">
+            <button id="topic-edit-btn" class="mini" type="button">编辑</button>
+            <button id="topic-regen-btn" class="mini" type="button">重新生成</button>
+          </span>
+          <button id="topic-generate-btn" class="mini hidden" type="button">生成议题时间轴</button>
+        </div>
+        <div id="topic-timeline" class="topic-timeline" aria-label="议题时间轴，点击定位到该议题开头"></div>
+      </div>
+      <div id="polish-warning" class="polish-warning hidden" role="alert">
+        <span id="polish-warning-text"></span>
+        <button id="polish-warning-close" type="button" class="polish-warning-close" aria-label="关闭告警" title="关闭告警">×</button>
+      </div>
+    </div>
+
+    <div class="meeting-sticky">
+      <div class="search-bar">
+        <span class="search-icon" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+        </span>
+        <input id="search-input" type="text" placeholder="搜索原文、纪要、总结…" aria-label="搜索">
+        <span id="search-count" class="search-count"></span>
+        <button id="search-prev" type="button" class="mini" title="上一个 (Shift+Enter)" aria-label="上一个匹配">↑</button>
+        <button id="search-next" type="button" class="mini" title="下一个 (Enter)" aria-label="下一个匹配">↓</button>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="raw" role="tab">原文</button>
+        <button class="tab-btn" data-tab="processed" role="tab">整理版</button>
+        <button class="tab-btn" data-tab="summary" role="tab">会议总结</button>
+        <button class="tab-btn" data-tab="compare" role="tab">对照</button>
+      </div>
+    </div>
+
+    <article class="meeting-body">
+      <div id="tab-raw" class="panel active" role="tabpanel">
+        <div id="transcript" class="transcript"></div>
+      </div>
+      <div id="tab-processed" class="panel" role="tabpanel">
+        <div id="proc-tools" class="md-tools hidden"><button id="proc-edit-btn" class="mini" type="button">编辑</button></div>
+        <div id="processed-md" class="rendered-md"></div>
+      </div>
+      <div id="tab-summary" class="panel" role="tabpanel">
+        <div id="notes-section" class="notes-section hidden">
+          <div class="notes-head">
+            <button id="notes-toggle" type="button" class="notes-toggle" aria-expanded="false">
+              <span class="notes-caret" aria-hidden="true">▸</span>
+              我的笔记 <span id="notes-count" class="notes-count"></span>
+            </button>
+            <button id="note-add-free" class="mini" type="button">＋ 写笔记</button>
+          </div>
+          <div id="notes-list" class="notes-list hidden"></div>
+        </div>
+        <div id="sum-tools" class="md-tools hidden"><button id="sum-edit-btn" class="mini" type="button">编辑</button></div>
+        <div id="summary-md" class="rendered-md"></div>
+      </div>
+      <div id="tab-compare" class="panel" role="tabpanel">
+        <div class="compare-grid">
+          <div class="compare-col" id="compare-raw">
+            <h3>原文 <span class="col-sub">（按说话人轮次）</span></h3>
+            <div id="compare-raw-body"></div>
+          </div>
+          <div class="compare-col" id="compare-processed">
+            <h3>整理版</h3>
+            <div id="compare-processed-body"></div>
+          </div>
+        </div>
+      </div>
+    </article>
+  </main>
+
+  <div id="edit-modal" class="modal hidden">
+    <div class="modal-card">
+      <h3>编辑句子</h3>
+      <p class="hint">双击句子打开此框。保存后原文/导出/对照都会用新文本。</p>
+      <textarea id="edit-text" rows="4"></textarea>
+      <label class="hotword-add">
+        说话人 <select id="edit-speaker" aria-label="这句话的说话人"></select>
+        <span class="hint">（cam++ 把多人并一人 / 一人拆两人时，可在这里改归属；改「新建」会拆出一个新说话人）</span>
+      </label>
+      <label class="hotword-add">
+        <input id="edit-add-hotword" type="checkbox"> 把这句加入热词（提升后续识别，建议挑关键短语）
+      </label>
+      <div id="edit-hint" class="settings-result"></div>
+      <div class="modal-actions">
+        <button id="edit-cancel" type="button">取消</button>
+        <button id="edit-save" type="button" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="log-modal" class="modal hidden">
+    <div class="modal-card modal-card-wide">
+      <h3>处理日志</h3>
+      <div class="log-progress">
+        <div class="log-progress-head">
+          <span id="log-step-text" class="log-step-text">—</span>
+          <span id="log-pct" class="log-pct">0%</span>
+        </div>
+        <div class="log-progress-bar"><div id="log-progress-fill"></div></div>
+        <div class="log-progress-meta">
+          <span id="log-elapsed"></span>
+          <span id="log-staleness"></span>
+        </div>
+      </div>
+      <pre id="log-body" class="log-body"></pre>
+      <div class="modal-actions">
+        <button id="log-close-btn" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="polish-setup-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3 id="polish-setup-title">开始整理</h3>
+      <p class="hint">确认识别原文没问题后开始。会议背景/术语会帮模型改准人名和专有名词。</p>
+      <label class="template-label">整理模板 <select id="modal-template-select" aria-label="整理模板"></select></label>
+      <label class="template-label" for="modal-meeting-context" style="display:block;margin-top:12px">会议背景 / 关键术语（可选，填了整理更准）</label>
+      <textarea id="modal-meeting-context" name="modal-meeting-context" aria-label="会议背景与关键术语" placeholder="例如：X 项目周会；术语：K8s、灰度发布；参会：张三、李四" style="width:100%;min-height:88px;box-sizing:border-box;margin-top:6px"></textarea>
+      <div class="modal-actions">
+        <button id="polish-setup-cancel" type="button">取消</button>
+        <button id="polish-setup-confirm" type="button" class="primary">开始整理</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="note-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3 id="note-modal-title">写笔记</h3>
+      <p class="hint" id="note-modal-anchor"></p>
+      <textarea id="note-text" rows="5" maxlength="2000" style="width:100%;box-sizing:border-box" aria-label="笔记内容"></textarea>
+      <div id="note-hint" class="settings-result"></div>
+      <div class="modal-actions">
+        <button id="note-delete" type="button" class="danger hidden">删除笔记</button>
+        <span class="modal-spacer"></span>
+        <button id="note-cancel" type="button">取消</button>
+        <button id="note-save" type="button" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="topic-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3>编辑议题段</h3>
+      <label class="template-label" style="display:block">议题名 <input id="topic-modal-name" type="text" maxlength="40" style="width:100%;box-sizing:border-box;margin-top:6px"></label>
+      <label class="template-label" style="display:block;margin-top:12px">阶段 <select id="topic-modal-phase" aria-label="阶段"></select></label>
+      <label class="template-label" style="display:block;margin-top:12px">结束时间（本段与下一段的分界，格式 m:ss）
+        <input id="topic-modal-end" type="text" placeholder="例如 12:34" style="width:100%;box-sizing:border-box;margin-top:6px">
+      </label>
+      <div id="topic-modal-hint" class="settings-result"></div>
+      <div class="modal-actions">
+        <button id="topic-modal-delete" type="button" class="danger">删除该段（并入前段）</button>
+        <span class="modal-spacer"></span>
+        <button id="topic-modal-cancel" type="button">取消</button>
+        <button id="topic-modal-save" type="button" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="msg-modal" class="modal hidden" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal-card dlg-card">
+      <h3 id="msg-title">提示</h3>
+      <div id="msg-body"></div>
+      <div id="msg-actions" class="modal-actions"></div>
+    </div>
+  </div>
+
+  <div class="audio-bar">
+    <audio id="audio-player" controls preload="metadata"></audio>
+    <div class="play-opts">
+      <label>倍速
+        <select id="playback-rate" aria-label="播放倍速">
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+      </label>
+      <label class="skip-silence-label" title="自动跳过句间静音段">
+        <input type="checkbox" id="skip-silence"> 跳静音
+      </label>
+    </div>
+  </div>
+
+  <script src="/static/access.js?v=1"></script>
+  <script src="/static/marked.min.js?v=1"></script>
+  <script src="/static/common.js?v=5"></script>
+  <script src="/static/meeting.js?v=32"></script>
+</body>
+</html>
