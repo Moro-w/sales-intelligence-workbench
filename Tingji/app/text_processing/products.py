@@ -1,6 +1,7 @@
 """Independent board/clean products on Tingji's existing queue and storage primitives.
 Legacy files are read-only. Draft publication is NOT semantic acceptance.
 """
+import json
 import time
 import uuid
 from app import text_storage as store, storage
@@ -283,6 +284,51 @@ class Products:
                         atomic_json(path,job)
             except (store.TextError,OSError):pass
 
+    def _board_errors(self,value,planning):
+        """Per-item blocking failures, mapped back to the model's own items by their id."""
+        try:
+            draft=build_draft([value],planning['units'])
+        except store.TextError as exc:
+            return [{'field_id':None,'section':None,'item_text':None,'code':exc.code,'message':exc.message}]
+        by_id={}
+        for section,items in value.get('sections',{}).items():
+            for item in items:
+                if isinstance(item,dict) and item.get('id'):by_id[item['id']]=(section,item)
+        errors=[]
+        for issue in draft.get('issues',[]):
+            if issue.get('severity')!='blocking':continue
+            fid=issue.get('field_id')
+            section,item=by_id.get(fid,(None,None))
+            errors.append({'field_id':fid,'section':section,
+                           'item_text':(item or {}).get('text') if isinstance(item,dict) else None,
+                           'code':issue['code'],'message':issue['message']})
+        return errors
+
+    def _correct_board(self,owner,value,planning,job,clean_input,chunk,index):
+        """Feed the model its own validation failures and let it correct them (bounded, budgeted)."""
+        from .board_first import board_messages_from_clean
+        errors=self._board_errors(value,planning)
+        if not errors:return value
+        best,count=value,len(errors)
+        instruction=('你上一版看板有部分条目未通过校验，请重新输出完整sections，只修正失败的条目，其余保持原样，不得省略或新增事实。'
+                     '规则：'
+                     '1) 数字/金额/单位/时间必须逐字来自evidence原话；原话没有的单位（如“小时”“个”）不得添加。'
+                     '2) speaker必须与evidence发言标签一致。'
+                     '3) 只有evidence原话里出现明确同意/承诺词（如：同意、可以、好、行、确认、我会、我会把…发你、…可以）的，才能标agreed；'
+                     '像“先…”“都用假的”“还没定”这类没有明确同意词的说法，标tentative或reported，不要标agreed，也不要放进已达成事项。'
+                     '4) 原话的否定（不/没/别/未）与审批状态（未审批/还没批）必须保留在text里。')
+        for _ in range(2):
+            if self.closing.is_set():break
+            prompt=board_messages_from_clean(planning['units'],chunk,clean_input)
+            prompt.append({'role':'user','content':json.dumps({'previous_candidate':value,'validation_errors':errors,'instruction':instruction},ensure_ascii=False,separators=(',',':'))})
+            try:candidate=board_payload(self.model.call(prompt,owner,job['source_sha256'],'board_draft',index))
+            except store.TextError:break
+            new_errors=self._board_errors(candidate,planning)
+            if len(new_errors)<count:
+                value,best,count,errors=candidate,candidate,len(new_errors),new_errors
+                if not new_errors:break
+        return best
+
     def _run(self,owner,mid,product,planning,job):
         from .board_first import board_messages_from_clean
         directory=self.directory(owner,mid,product);parts=[];kept=[];chain=False
@@ -310,6 +356,7 @@ class Products:
                         try:
                             if product=='board':
                                 value=board_payload(value)
+                                value=self._correct_board(owner,value,planning,job,clean_input,chunk,index)
                             else:clean_rows(value,chunk)
                         except store.TextError as exc:
                             atomic_json(directory/'rejected'/f'{time.time_ns()}-{index}.json',{'payload':value,'code':exc.code,'plan_hash':job['plan_hash']});raise
